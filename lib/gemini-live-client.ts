@@ -1,10 +1,18 @@
-import { GoogleGenAI, Modality, type LiveServerMessage, type Session } from "@google/genai";
 import {
-  type AccentId,
+  GoogleGenAI,
+  Modality,
+  type LiveServerMessage,
+  type Session,
+} from "@google/genai";
+import {
   buildSystemInstruction,
-  getAccentConfig,
+  INITIAL_GREETING_PROMPT,
 } from "./arabic-instructions";
-import { resolveGeminiLiveModel } from "./gemini-key";
+import {
+  GEMINI_API_KEY_CANDIDATES,
+  getGeminiApiKey,
+  resolveGeminiLiveModels,
+} from "./gemini-key";
 
 export type AgentStatus =
   | "idle"
@@ -26,7 +34,11 @@ export interface GeminiLiveCallbacks {
 }
 
 function int16ToBase64(int16: Int16Array): string {
-  const bytes = new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength);
+  const bytes = new Uint8Array(
+    int16.buffer,
+    int16.byteOffset,
+    int16.byteLength
+  );
   let binary = "";
   const chunkSize = 0x8000;
   for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -72,7 +84,10 @@ function downsampleTo16kHz(
       sum += input[j];
       count++;
     }
-    const sample = count > 0 ? sum / count : input[Math.min(start, input.length - 1)] || 0;
+    const sample =
+      count > 0
+        ? sum / count
+        : input[Math.min(start, input.length - 1)] || 0;
     const clamped = Math.max(-1, Math.min(1, sample));
     result[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
   }
@@ -99,19 +114,18 @@ export class GeminiLiveVoiceClient {
     this.callbacks = callbacks;
   }
 
-  async start(apiKey: string, accentId: AccentId): Promise<void> {
+  async start(): Promise<void> {
     if (this.isConnected) {
       await this.stop();
     }
 
-    this.callbacks.onStatusChange("connecting", "Connecting to Gemini...");
+    this.callbacks.onStatusChange("connecting", "Connecting...");
     this.transcripts = [];
     this.currentUserText = "";
     this.currentAgentText = "";
     this.callbacks.onTranscriptUpdate?.([]);
 
     try {
-      // Request microphone access first so user permission is granted
       this.micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -121,12 +135,6 @@ export class GeminiLiveVoiceClient {
         },
       });
 
-      // Resolve best supported Live native-audio model for this API key
-      const model = await resolveGeminiLiveModel(apiKey);
-      const accent = getAccentConfig(accentId);
-      const systemInstruction = buildSystemInstruction(accentId);
-
-      // Prepare output audio context (Gemini outputs 24kHz PCM)
       const AudioContextClass =
         window.AudioContext ||
         (window as unknown as { webkitAudioContext: typeof AudioContext })
@@ -138,57 +146,57 @@ export class GeminiLiveVoiceClient {
       }
       this.nextStartTime = 0;
 
-      const ai = new GoogleGenAI({ apiKey });
+      const primaryKey = getGeminiApiKey();
+      const candidateKeys = Array.from(
+        new Set([primaryKey, ...GEMINI_API_KEY_CANDIDATES].filter(Boolean))
+      );
 
-      this.session = await ai.live.connect({
-        model,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: accent.voiceName,
-              },
-            },
-          },
-          systemInstruction: {
-            parts: [{ text: systemInstruction }],
-          },
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-        },
-        callbacks: {
-          onopen: () => {
-            this.isConnected = true;
-          },
-          onmessage: (message: LiveServerMessage) => {
-            this.handleServerMessage(message);
-          },
-          onerror: (err: ErrorEvent) => {
-            const msg = err?.message || "Gemini Live WebSocket error";
-            this.callbacks.onError?.(msg);
-            this.callbacks.onStatusChange("error", msg);
-          },
-          onclose: () => {
-            if (this.isConnected) {
-              this.isConnected = false;
-              this.cleanupAudio();
-              this.callbacks.onStatusChange("idle", "Ready to speak with you");
+      const candidateModels = await resolveGeminiLiveModels(primaryKey);
+      const systemInstruction = buildSystemInstruction();
+
+      let connectedSession: Session | null = null;
+      let lastError: unknown = null;
+
+      outer: for (const key of candidateKeys) {
+        for (const useVertex of [false, true]) {
+          for (const model of candidateModels.slice(0, 2)) {
+            try {
+              connectedSession = await this.tryConnectSession(
+                key,
+                model,
+                systemInstruction,
+                useVertex
+              );
+              if (connectedSession) {
+                break outer;
+              }
+            } catch (err) {
+              lastError = err;
             }
-          },
-        },
-      });
+          }
+        }
+      }
 
+      if (!connectedSession) {
+        throw (
+          lastError ||
+          new Error("Unable to establish Gemini Live voice session.")
+        );
+      }
+
+      this.session = connectedSession;
       this.isConnected = true;
       this.startMicrophoneStreaming();
-      this.callbacks.onStatusChange("listening", "Agent ready — speak now");
+      this.callbacks.onStatusChange(
+        "listening",
+        "Agent ready to speak with you"
+      );
 
-      // Trigger a natural opening greeting in the chosen local Arabic dialect (or English)
       this.session.sendClientContent({
         turns: [
           {
             role: "user",
-            parts: [{ text: accent.initialGreetingPrompt }],
+            parts: [{ text: INITIAL_GREETING_PROMPT }],
           },
         ],
         turnComplete: true,
@@ -204,22 +212,102 @@ export class GeminiLiveVoiceClient {
     }
   }
 
-  switchAccentLive(accentId: AccentId): void {
-    if (!this.isConnected || !this.session) return;
-    const accent = getAccentConfig(accentId);
-    this.stopPlaybackQueue();
-    this.session.sendClientContent({
-      turns: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: `[SYSTEM INSTRUCTION UPDATE: Immediately switch your speaking accent/dialect to follow these rules:\n${accent.dialectInstructions}\n\nNow acknowledge briefly in this exact dialect: ${accent.initialGreetingPrompt}]`,
+  private async tryConnectSession(
+    apiKey: string,
+    model: string,
+    systemInstruction: string,
+    vertexai: boolean
+  ): Promise<Session> {
+    const ai = new GoogleGenAI({
+      apiKey,
+      ...(vertexai ? { vertexai: true } : {}),
+    });
+
+    return await new Promise<Session>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error("Connection timeout"));
+        }
+      }, 8000);
+
+      ai.live
+        .connect({
+          model,
+          config: {
+            responseModalities: [Modality.AUDIO],
+            // Note: languageCode is intentionally omitted so Gemini Live
+            // automatically detects and switches between Arabic dialects and English
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: "Aoede",
+                },
+              },
             },
-          ],
-        },
-      ],
-      turnComplete: true,
+            systemInstruction: {
+              parts: [{ text: systemInstruction }],
+            },
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+          },
+          callbacks: {
+            onopen: () => {
+              // Socket opened; ai.live.connect resolves after setupComplete
+            },
+            onmessage: (message: LiveServerMessage) => {
+              this.handleServerMessage(message);
+            },
+            onerror: (err: ErrorEvent) => {
+              const msg = err?.message || "Gemini Live WebSocket error";
+              if (!settled) {
+                settled = true;
+                clearTimeout(timer);
+                reject(new Error(msg));
+              } else if (this.isConnected) {
+                this.callbacks.onError?.(msg);
+                this.callbacks.onStatusChange("error", msg);
+              }
+            },
+            onclose: (ev: CloseEvent) => {
+              if (!settled) {
+                settled = true;
+                clearTimeout(timer);
+                reject(
+                  new Error(ev?.reason || `Connection closed (${ev?.code || 0})`)
+                );
+              } else if (this.isConnected) {
+                this.isConnected = false;
+                this.cleanupAudio();
+                this.callbacks.onStatusChange(
+                  "idle",
+                  "Agent ready to speak with you"
+                );
+              }
+            },
+          },
+        })
+        .then((session) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(session);
+          } else {
+            try {
+              session.close();
+            } catch {
+              // ignore
+            }
+          }
+        })
+        .catch((err) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+          }
+        });
     });
   }
 
@@ -234,7 +322,9 @@ export class GeminiLiveVoiceClient {
     this.inputAudioCtx = new AudioContextClass();
     const inputSampleRate = this.inputAudioCtx.sampleRate;
 
-    this.sourceNode = this.inputAudioCtx.createMediaStreamSource(this.micStream);
+    this.sourceNode = this.inputAudioCtx.createMediaStreamSource(
+      this.micStream
+    );
     this.processorNode = this.inputAudioCtx.createScriptProcessor(2048, 1, 1);
 
     this.processorNode.onaudioprocess = (event: AudioProcessingEvent) => {
@@ -263,25 +353,24 @@ export class GeminiLiveVoiceClient {
     const content = message.serverContent;
     if (!content) return;
 
-    // Handle user barge-in / interruption
     if (content.interrupted) {
       this.stopPlaybackQueue();
-      this.callbacks.onStatusChange("listening", "Listening...");
+      this.callbacks.onStatusChange(
+        "listening",
+        "Agent ready to speak with you"
+      );
     }
 
-    // Handle input transcription
     if (content.inputTranscription?.text) {
       this.currentUserText += content.inputTranscription.text;
       this.upsertTranscript("user", this.currentUserText.trim());
     }
 
-    // Handle output transcription
     if (content.outputTranscription?.text) {
       this.currentAgentText += content.outputTranscription.text;
       this.upsertTranscript("agent", this.currentAgentText.trim());
     }
 
-    // Handle audio output chunks
     if (content.modelTurn?.parts) {
       for (const part of content.modelTurn.parts) {
         const inlineData = part.inlineData;
@@ -295,7 +384,10 @@ export class GeminiLiveVoiceClient {
       this.currentUserText = "";
       this.currentAgentText = "";
       if (this.activeSources.size === 0 && this.isConnected) {
-        this.callbacks.onStatusChange("listening", "Listening...");
+        this.callbacks.onStatusChange(
+          "listening",
+          "Agent ready to speak with you"
+        );
       }
     }
   }
@@ -348,7 +440,10 @@ export class GeminiLiveVoiceClient {
     source.onended = () => {
       this.activeSources.delete(source);
       if (this.activeSources.size === 0 && this.isConnected) {
-        this.callbacks.onStatusChange("listening", "Listening...");
+        this.callbacks.onStatusChange(
+          "listening",
+          "Agent ready to speak with you"
+        );
       }
     };
   }
@@ -426,6 +521,6 @@ export class GeminiLiveVoiceClient {
       }
       this.session = null;
     }
-    this.callbacks.onStatusChange("idle", "Ready to speak with you");
+    this.callbacks.onStatusChange("idle", "Agent ready to speak with you");
   }
 }
