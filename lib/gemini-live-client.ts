@@ -104,14 +104,46 @@ export class GeminiLiveVoiceClient {
     this.callbacks.onStatusChange("connecting", "Connecting…");
 
     try {
-      this.micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      // `navigator.mediaDevices` only exists in a secure context (https:// or
+      // http://localhost). On an insecure origin such as http://<LAN-IP>:3000
+      // it is undefined — which is what caused "Cannot read properties of
+      // undefined (reading 'getUserMedia')". Give a clear, actionable message.
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error(
+          "Microphone access needs a secure connection. Open the app at " +
+            "http://localhost:3000 (the “Local” URL), not the plain " +
+            "http:// LAN/Network address. To test on a phone over your " +
+            "network, run: npm run dev:https"
+        );
+      }
+
+      try {
+        this.micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      } catch (micErr) {
+        if (micErr instanceof DOMException) {
+          if (micErr.name === "NotAllowedError" || micErr.name === "SecurityError") {
+            throw new Error(
+              "Microphone permission was blocked. Allow mic access for this site in your browser, then try again."
+            );
+          }
+          if (micErr.name === "NotFoundError" || micErr.name === "DevicesNotFoundError") {
+            throw new Error("No microphone was found. Connect a microphone and try again.");
+          }
+          if (micErr.name === "NotReadableError" || micErr.name === "TrackStartError") {
+            throw new Error(
+              "Your microphone is busy or unavailable. Close other apps that may be using it, then try again."
+            );
+          }
+        }
+        throw micErr;
+      }
 
       this.unlockAudio();
       if (this.outputCtx && this.outputCtx.state === "suspended") {
