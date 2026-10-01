@@ -1,17 +1,16 @@
+"use client";
+
 import {
   GoogleGenAI,
   Modality,
   type LiveServerMessage,
   type Session,
 } from "@google/genai";
+import { buildSystemInstruction, INITIAL_GREETING_PROMPT } from "./arabic-instructions";
 import {
-  buildSystemInstruction,
-  INITIAL_GREETING_PROMPT,
-} from "./arabic-instructions";
-import {
-  GEMINI_API_KEY_CANDIDATES,
+  DEFAULT_VOICE_NAME,
   getGeminiApiKey,
-  resolveGeminiLiveModels,
+  LIVE_MODEL_CANDIDATES,
 } from "./gemini-key";
 
 export type AgentStatus =
@@ -21,17 +20,15 @@ export type AgentStatus =
   | "speaking"
   | "error";
 
-export interface TranscriptEntry {
-  id: string;
-  role: "user" | "agent";
-  text: string;
-}
-
 export interface GeminiLiveCallbacks {
   onStatusChange: (status: AgentStatus, detail?: string) => void;
-  onTranscriptUpdate?: (entries: TranscriptEntry[]) => void;
   onError?: (errorMessage: string) => void;
 }
+
+const READY_TEXT = "Agent ready to speak with you";
+const OUTPUT_SAMPLE_RATE = 24000; // Gemini native-audio output rate
+const INPUT_SAMPLE_RATE = 16000; // Mic stream rate expected by Gemini
+const CONNECT_TIMEOUT_MS = 12000;
 
 function int16ToBase64(int16: Int16Array): string {
   const bytes = new Uint8Array(
@@ -42,8 +39,7 @@ function int16ToBase64(int16: Int16Array): string {
   let binary = "";
   const chunkSize = 0x8000;
   for (let i = 0; i < bytes.length; i += chunkSize) {
-    const slice = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode(...slice);
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
   }
   return btoa(binary);
 }
@@ -51,160 +47,137 @@ function int16ToBase64(int16: Int16Array): string {
 function base64ToInt16(base64: string): Int16Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return new Int16Array(bytes.buffer);
 }
 
-function downsampleTo16kHz(
-  input: Float32Array,
-  inputSampleRate: number
-): Int16Array {
-  const targetRate = 16000;
-  if (inputSampleRate === targetRate) {
-    const out = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-      const s = Math.max(-1, Math.min(1, input[i]));
-      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    return out;
-  }
+type AudioContextCtor = typeof AudioContext;
 
-  const ratio = inputSampleRate / targetRate;
-  const newLength = Math.round(input.length / ratio);
-  const result = new Int16Array(newLength);
-
-  for (let i = 0; i < newLength; i++) {
-    const start = Math.floor(i * ratio);
-    const end = Math.min(input.length, Math.floor((i + 1) * ratio));
-    let sum = 0;
-    let count = 0;
-    for (let j = start; j < end; j++) {
-      sum += input[j];
-      count++;
-    }
-    const sample =
-      count > 0
-        ? sum / count
-        : input[Math.min(start, input.length - 1)] || 0;
-    const clamped = Math.max(-1, Math.min(1, sample));
-    result[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
-  }
-
-  return result;
+function getAudioContextCtor(): AudioContextCtor {
+  return (
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: AudioContextCtor })
+      .webkitAudioContext
+  );
 }
 
 export class GeminiLiveVoiceClient {
   private session: Session | null = null;
   private micStream: MediaStream | null = null;
-  private inputAudioCtx: AudioContext | null = null;
-  private outputAudioCtx: AudioContext | null = null;
-  private processorNode: ScriptProcessorNode | null = null;
-  private sourceNode: MediaStreamAudioSourceNode | null = null;
+  private inputCtx: AudioContext | null = null;
+  private outputCtx: AudioContext | null = null;
+  private micSource: MediaStreamAudioSourceNode | null = null;
+  private workletNode: AudioWorkletNode | null = null;
   private activeSources = new Set<AudioBufferSourceNode>();
   private nextStartTime = 0;
   private isConnected = false;
-  private callbacks: GeminiLiveCallbacks;
-  private transcripts: TranscriptEntry[] = [];
-  private currentUserText = "";
-  private currentAgentText = "";
+  private readonly callbacks: GeminiLiveCallbacks;
 
   constructor(callbacks: GeminiLiveCallbacks) {
     this.callbacks = callbacks;
   }
 
-  async start(): Promise<void> {
-    if (this.isConnected) {
-      await this.stop();
-    }
-
-    this.callbacks.onStatusChange("connecting", "Connecting...");
-    this.transcripts = [];
-    this.currentUserText = "";
-    this.currentAgentText = "";
-    this.callbacks.onTranscriptUpdate?.([]);
-
+  /**
+   * Create + resume the output AudioContext SYNCHRONOUSLY. This MUST be called
+   * directly inside the user's click gesture so browsers do not block audio
+   * playback (prevents the "AudioContext was not allowed to start" warning).
+   */
+  unlockAudio(): void {
     try {
-      this.micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-
-      const AudioContextClass =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext })
-          .webkitAudioContext;
-
-      this.outputAudioCtx = new AudioContextClass({ sampleRate: 24000 });
-      if (this.outputAudioCtx.state === "suspended") {
-        await this.outputAudioCtx.resume();
-      }
-      this.nextStartTime = 0;
-
-      const primaryKey = getGeminiApiKey();
-      const candidateKeys = Array.from(
-        new Set([primaryKey, ...GEMINI_API_KEY_CANDIDATES].filter(Boolean))
-      );
-
-      const candidateModels = await resolveGeminiLiveModels(primaryKey);
-      const systemInstruction = buildSystemInstruction();
-
-      let connectedSession: Session | null = null;
-      let lastError: unknown = null;
-
-      outer: for (const key of candidateKeys) {
-        for (const useVertex of [false, true]) {
-          for (const model of candidateModels.slice(0, 2)) {
-            try {
-              connectedSession = await this.tryConnectSession(
-                key,
-                model,
-                systemInstruction,
-                useVertex
-              );
-              if (connectedSession) {
-                break outer;
-              }
-            } catch (err) {
-              lastError = err;
-            }
-          }
+      if (!this.outputCtx) {
+        const Ctx = getAudioContextCtor();
+        try {
+          this.outputCtx = new Ctx({ sampleRate: OUTPUT_SAMPLE_RATE });
+        } catch {
+          this.outputCtx = new Ctx();
         }
       }
+      if (this.outputCtx.state === "suspended") void this.outputCtx.resume();
+    } catch {
+      // Ignore — start() will surface a real error if audio is unavailable.
+    }
+  }
 
-      if (!connectedSession) {
-        throw (
-          lastError ||
-          new Error("Unable to establish Gemini Live voice session.")
+  async start(): Promise<void> {
+    if (this.isConnected) await this.stop();
+
+    this.callbacks.onStatusChange("connecting", "Connecting…");
+
+    try {
+      // `navigator.mediaDevices` only exists in a secure context (https:// or
+      // http://localhost). On an insecure origin such as http://<LAN-IP>:3000
+      // it is undefined — which is what caused "Cannot read properties of
+      // undefined (reading 'getUserMedia')". Give a clear, actionable message.
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error(
+          "Microphone access needs a secure connection. Open the app at " +
+            "http://localhost:3000 (the “Local” URL), not the plain " +
+            "http:// LAN/Network address. To test on a phone over your " +
+            "network, run: npm run dev:https"
         );
       }
 
-      this.session = connectedSession;
-      this.isConnected = true;
-      this.startMicrophoneStreaming();
-      this.callbacks.onStatusChange(
-        "listening",
-        "Agent ready to speak with you"
-      );
-
-      this.session.sendClientContent({
-        turns: [
-          {
-            role: "user",
-            parts: [{ text: INITIAL_GREETING_PROMPT }],
+      try {
+        this.micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
           },
-        ],
-        turnComplete: true,
-      });
+        });
+      } catch (micErr) {
+        if (micErr instanceof DOMException) {
+          if (micErr.name === "NotAllowedError" || micErr.name === "SecurityError") {
+            throw new Error(
+              "Microphone permission was blocked. Allow mic access for this site in your browser, then try again."
+            );
+          }
+          if (micErr.name === "NotFoundError" || micErr.name === "DevicesNotFoundError") {
+            throw new Error("No microphone was found. Connect a microphone and try again.");
+          }
+          if (micErr.name === "NotReadableError" || micErr.name === "TrackStartError") {
+            throw new Error(
+              "Your microphone is busy or unavailable. Close other apps that may be using it, then try again."
+            );
+          }
+        }
+        throw micErr;
+      }
+
+      this.unlockAudio();
+      if (this.outputCtx && this.outputCtx.state === "suspended") {
+        await this.outputCtx.resume().catch(() => undefined);
+      }
+
+      const session = await this.connectWithFallback();
+      this.session = session;
+      this.isConnected = true;
+      this.nextStartTime = this.outputCtx
+        ? this.outputCtx.currentTime
+        : 0;
+
+      // Fire the opening greeting immediately (overlaps with mic setup) so the
+      // agent starts speaking for itself with the lowest possible first-word
+      // latency.
+      try {
+        session.sendClientContent({
+          turns: [
+            { role: "user", parts: [{ text: INITIAL_GREETING_PROMPT }] },
+          ],
+          turnComplete: true,
+        });
+      } catch {
+        // Non-fatal; the agent can still respond to the live mic.
+      }
+
+      await this.startMicrophone();
+
+      this.callbacks.onStatusChange("listening", READY_TEXT);
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to start voice agent";
-      this.cleanupAudio();
+      this.cleanup();
       this.isConnected = false;
       this.callbacks.onError?.(message);
       this.callbacks.onStatusChange("error", message);
@@ -212,141 +185,141 @@ export class GeminiLiveVoiceClient {
     }
   }
 
-  private async tryConnectSession(
+  private async connectWithFallback(): Promise<Session> {
+    const apiKey = getGeminiApiKey();
+    const systemInstruction = buildSystemInstruction();
+    let lastError: unknown = null;
+
+    for (const model of LIVE_MODEL_CANDIDATES) {
+      try {
+        return await this.connectSession(apiKey, model, systemInstruction);
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw (
+      lastError || new Error("Unable to establish a Gemini Live session.")
+    );
+  }
+
+  private connectSession(
     apiKey: string,
     model: string,
-    systemInstruction: string,
-    vertexai: boolean
+    systemInstruction: string
   ): Promise<Session> {
-    const ai = new GoogleGenAI({
-      apiKey,
-      ...(vertexai ? { vertexai: true } : {}),
-    });
+    const ai = new GoogleGenAI({ apiKey });
 
-    return await new Promise<Session>((resolve, reject) => {
+    return new Promise<Session>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
         if (!settled) {
           settled = true;
-          reject(new Error("Connection timeout"));
+          reject(new Error(`Connection to "${model}" timed out.`));
         }
-      }, 8000);
+      }, CONNECT_TIMEOUT_MS);
+
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      };
+      const succeed = (session: Session) => {
+        if (settled) {
+          try {
+            session.close();
+          } catch {
+            // ignore
+          }
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve(session);
+      };
 
       ai.live
         .connect({
           model,
           config: {
             responseModalities: [Modality.AUDIO],
-            // Note: languageCode is intentionally omitted so Gemini Live
-            // automatically detects and switches between Arabic dialects and English
             speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: "Aoede",
-                },
-              },
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: DEFAULT_VOICE_NAME } },
             },
-            systemInstruction: {
-              parts: [{ text: systemInstruction }],
-            },
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
+            systemInstruction: { parts: [{ text: systemInstruction }] },
+            // Server-side voice activity detection (default) — keeps turn
+            // taking automatic and responsive.
+            realtimeInputConfig: { automaticActivityDetection: {} },
           },
           callbacks: {
             onopen: () => {
-              // Socket opened; ai.live.connect resolves after setupComplete
+              // Resolves on setupComplete (see .then below).
             },
-            onmessage: (message: LiveServerMessage) => {
-              this.handleServerMessage(message);
+            onmessage: (message: LiveServerMessage) =>
+              this.handleServerMessage(message),
+            onerror: (event: ErrorEvent) => {
+              const msg = event?.message || "Gemini Live WebSocket error.";
+              if (settled) this.handleRuntimeError(msg);
+              else fail(new Error(msg));
             },
-            onerror: (err: ErrorEvent) => {
-              const msg = err?.message || "Gemini Live WebSocket error";
-              if (!settled) {
-                settled = true;
-                clearTimeout(timer);
-                reject(new Error(msg));
-              } else if (this.isConnected) {
-                this.callbacks.onError?.(msg);
-                this.callbacks.onStatusChange("error", msg);
-              }
-            },
-            onclose: (ev: CloseEvent) => {
-              if (!settled) {
-                settled = true;
-                clearTimeout(timer);
-                reject(
-                  new Error(ev?.reason || `Connection closed (${ev?.code || 0})`)
+            onclose: (event: CloseEvent) => {
+              if (settled) this.handleRuntimeClose();
+              else
+                fail(
+                  new Error(
+                    event?.reason ||
+                      `Connection closed (${event?.code || 0}).`
+                  )
                 );
-              } else if (this.isConnected) {
-                this.isConnected = false;
-                this.cleanupAudio();
-                this.callbacks.onStatusChange(
-                  "idle",
-                  "Agent ready to speak with you"
-                );
-              }
             },
           },
         })
-        .then((session) => {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            resolve(session);
-          } else {
-            try {
-              session.close();
-            } catch {
-              // ignore
-            }
-          }
-        })
-        .catch((err) => {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            reject(err);
-          }
-        });
+        .then(succeed)
+        .catch(fail);
     });
   }
 
-  private startMicrophoneStreaming(): void {
+  private async startMicrophone(): Promise<void> {
     if (!this.micStream) return;
 
-    const AudioContextClass =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext })
-        .webkitAudioContext;
+    const Ctx = getAudioContextCtor();
+    this.inputCtx = new Ctx();
+    if (this.inputCtx.state === "suspended") {
+      await this.inputCtx.resume().catch(() => undefined);
+    }
 
-    this.inputAudioCtx = new AudioContextClass();
-    const inputSampleRate = this.inputAudioCtx.sampleRate;
+    await this.inputCtx.audioWorklet.addModule("/mic-processor.js");
 
-    this.sourceNode = this.inputAudioCtx.createMediaStreamSource(
-      this.micStream
-    );
-    this.processorNode = this.inputAudioCtx.createScriptProcessor(2048, 1, 1);
+    this.micSource = this.inputCtx.createMediaStreamSource(this.micStream);
+    this.workletNode = new AudioWorkletNode(this.inputCtx, "mic-processor", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    });
 
-    this.processorNode.onaudioprocess = (event: AudioProcessingEvent) => {
-      if (!this.isConnected || !this.session) return;
-      const inputData = event.inputBuffer.getChannelData(0);
-      const pcm16 = downsampleTo16kHz(inputData, inputSampleRate);
-      const base64Audio = int16ToBase64(pcm16);
-
+    this.workletNode.port.onmessage = (event: MessageEvent<Int16Array>) => {
+      const pcm = event.data;
+      if (!this.isConnected || !this.session || !pcm || pcm.length === 0) {
+        return;
+      }
       try {
         this.session.sendRealtimeInput({
           audio: {
-            data: base64Audio,
-            mimeType: "audio/pcm;rate=16000",
+            data: int16ToBase64(pcm),
+            mimeType: `audio/pcm;rate=${INPUT_SAMPLE_RATE}`,
           },
         });
       } catch {
-        // Ignore transient send errors when closing
+        // Ignore transient send errors while shutting down.
       }
     };
 
-    this.sourceNode.connect(this.processorNode);
-    this.processorNode.connect(this.inputAudioCtx.destination);
+    // Keep the node graph pulled without playing the mic back (avoids echo).
+    const silentGain = this.inputCtx.createGain();
+    silentGain.gain.value = 0;
+    this.micSource.connect(this.workletNode);
+    this.workletNode.connect(silentGain);
+    silentGain.connect(this.inputCtx.destination);
   }
 
   private handleServerMessage(message: LiveServerMessage): void {
@@ -354,165 +327,132 @@ export class GeminiLiveVoiceClient {
     if (!content) return;
 
     if (content.interrupted) {
-      this.stopPlaybackQueue();
-      this.callbacks.onStatusChange(
-        "listening",
-        "Agent ready to speak with you"
-      );
+      this.stopPlayback();
+      if (this.isConnected) this.callbacks.onStatusChange("listening", READY_TEXT);
     }
 
-    if (content.inputTranscription?.text) {
-      this.currentUserText += content.inputTranscription.text;
-      this.upsertTranscript("user", this.currentUserText.trim());
-    }
-
-    if (content.outputTranscription?.text) {
-      this.currentAgentText += content.outputTranscription.text;
-      this.upsertTranscript("agent", this.currentAgentText.trim());
-    }
-
-    if (content.modelTurn?.parts) {
-      for (const part of content.modelTurn.parts) {
-        const inlineData = part.inlineData;
-        if (inlineData?.data && inlineData.mimeType?.startsWith("audio/")) {
-          this.enqueueAudioChunk(inlineData.data);
+    const parts = content.modelTurn?.parts;
+    if (parts) {
+      for (const part of parts) {
+        const inline = part.inlineData;
+        if (inline?.data && inline.mimeType?.startsWith("audio/")) {
+          this.enqueueAudio(inline.data);
         }
       }
     }
 
-    if (content.turnComplete) {
-      this.currentUserText = "";
-      this.currentAgentText = "";
-      if (this.activeSources.size === 0 && this.isConnected) {
-        this.callbacks.onStatusChange(
-          "listening",
-          "Agent ready to speak with you"
-        );
-      }
+    if (content.turnComplete && this.activeSources.size === 0 && this.isConnected) {
+      this.callbacks.onStatusChange("listening", READY_TEXT);
     }
   }
 
-  private upsertTranscript(role: "user" | "agent", text: string): void {
-    if (!text) return;
-    const last = this.transcripts[this.transcripts.length - 1];
-    if (last && last.role === role) {
-      last.text = text;
-    } else {
-      this.transcripts.push({
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        role,
-        text,
-      });
-    }
-    this.callbacks.onTranscriptUpdate?.([...this.transcripts]);
-  }
-
-  private enqueueAudioChunk(base64Data: string): void {
-    if (!this.outputAudioCtx) return;
+  private enqueueAudio(base64Data: string): void {
+    if (!this.outputCtx) return;
 
     const pcm16 = base64ToInt16(base64Data);
     if (pcm16.length === 0) return;
 
     const float32 = new Float32Array(pcm16.length);
-    for (let i = 0; i < pcm16.length; i++) {
-      float32[i] = pcm16[i] / 32768;
-    }
+    for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768;
 
-    const audioBuffer = this.outputAudioCtx.createBuffer(
-      1,
-      float32.length,
-      24000
-    );
-    audioBuffer.getChannelData(0).set(float32);
+    // Always author at 24 kHz; the browser resamples to the context rate.
+    const buffer = this.outputCtx.createBuffer(1, float32.length, OUTPUT_SAMPLE_RATE);
+    buffer.getChannelData(0).set(float32);
 
-    const source = this.outputAudioCtx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(this.outputAudioCtx.destination);
+    const source = this.outputCtx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.outputCtx.destination);
 
-    const now = this.outputAudioCtx.currentTime;
+    const now = this.outputCtx.currentTime;
     const startAt = Math.max(now, this.nextStartTime);
     source.start(startAt);
-    this.nextStartTime = startAt + audioBuffer.duration;
+    this.nextStartTime = startAt + buffer.duration;
 
     this.activeSources.add(source);
-    this.callbacks.onStatusChange("speaking", "Agent speaking...");
+    this.callbacks.onStatusChange("speaking", "Agent speaking…");
 
     source.onended = () => {
       this.activeSources.delete(source);
       if (this.activeSources.size === 0 && this.isConnected) {
-        this.callbacks.onStatusChange(
-          "listening",
-          "Agent ready to speak with you"
-        );
+        this.callbacks.onStatusChange("listening", READY_TEXT);
       }
     };
   }
 
-  private stopPlaybackQueue(): void {
+  private stopPlayback(): void {
     for (const source of this.activeSources) {
       try {
         source.stop();
         source.disconnect();
       } catch {
-        // Ignore already stopped source
+        // ignore already-stopped sources
       }
     }
     this.activeSources.clear();
-    if (this.outputAudioCtx) {
-      this.nextStartTime = this.outputAudioCtx.currentTime;
-    }
+    if (this.outputCtx) this.nextStartTime = this.outputCtx.currentTime;
   }
 
-  private cleanupAudio(): void {
-    this.stopPlaybackQueue();
+  private handleRuntimeError(message: string): void {
+    if (!this.isConnected) return;
+    this.cleanup();
+    this.isConnected = false;
+    this.session = null;
+    this.callbacks.onError?.(message);
+    this.callbacks.onStatusChange("error", message);
+  }
 
-    if (this.processorNode) {
+  private handleRuntimeClose(): void {
+    if (!this.isConnected) return;
+    this.cleanup();
+    this.isConnected = false;
+    this.session = null;
+    this.callbacks.onStatusChange("idle", READY_TEXT);
+  }
+
+  private cleanup(): void {
+    this.stopPlayback();
+
+    if (this.workletNode) {
+      this.workletNode.port.onmessage = null;
       try {
-        this.processorNode.disconnect();
+        this.workletNode.disconnect();
       } catch {
         // ignore
       }
-      this.processorNode = null;
+      this.workletNode = null;
     }
-
-    if (this.sourceNode) {
+    if (this.micSource) {
       try {
-        this.sourceNode.disconnect();
+        this.micSource.disconnect();
       } catch {
         // ignore
       }
-      this.sourceNode = null;
+      this.micSource = null;
     }
-
-    if (this.inputAudioCtx) {
+    if (this.inputCtx) {
       try {
-        void this.inputAudioCtx.close();
+        void this.inputCtx.close();
       } catch {
         // ignore
       }
-      this.inputAudioCtx = null;
+      this.inputCtx = null;
     }
-
-    if (this.outputAudioCtx) {
+    if (this.outputCtx) {
       try {
-        void this.outputAudioCtx.close();
+        void this.outputCtx.close();
       } catch {
         // ignore
       }
-      this.outputAudioCtx = null;
+      this.outputCtx = null;
     }
-
     if (this.micStream) {
-      for (const track of this.micStream.getTracks()) {
-        track.stop();
-      }
+      for (const track of this.micStream.getTracks()) track.stop();
       this.micStream = null;
     }
   }
 
   async stop(): Promise<void> {
     this.isConnected = false;
-    this.cleanupAudio();
     if (this.session) {
       try {
         this.session.close();
@@ -521,6 +461,7 @@ export class GeminiLiveVoiceClient {
       }
       this.session = null;
     }
-    this.callbacks.onStatusChange("idle", "Agent ready to speak with you");
+    this.cleanup();
+    this.callbacks.onStatusChange("idle", READY_TEXT);
   }
 }

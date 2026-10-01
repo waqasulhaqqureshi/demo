@@ -1,10 +1,10 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  type AgentStatus,
   GeminiLiveVoiceClient,
-} from "../lib/gemini-live-client";
+  type AgentStatus,
+} from "@/lib/gemini-live-client";
 
 export default function Home() {
   const [status, setStatus] = useState<AgentStatus>("idle");
@@ -21,14 +21,15 @@ export default function Home() {
     };
   }, []);
 
-  const handleToggleAgent = async () => {
+  const isRunning =
+    status === "connecting" ||
+    status === "listening" ||
+    status === "speaking";
+
+  const handleToggle = async () => {
     setErrorMessage("");
 
-    if (
-      status === "connecting" ||
-      status === "listening" ||
-      status === "speaking"
-    ) {
+    if (isRunning) {
       await clientRef.current?.stop();
       return;
     }
@@ -37,49 +38,44 @@ export default function Home() {
       clientRef.current = new GeminiLiveVoiceClient({
         onStatusChange: (nextStatus, detail) => {
           setStatus(nextStatus);
-          if (detail) {
-            setStatusText(detail);
-          }
+          if (detail) setStatusText(detail);
         },
-        onError: (msg) => {
-          setErrorMessage(msg);
-        },
+        onError: (message) => setErrorMessage(message),
       });
     }
+
+    // Unlock the AudioContext synchronously inside the click gesture so the
+    // browser never blocks audio playback.
+    clientRef.current.unlockAudio();
 
     try {
       await clientRef.current.start();
     } catch {
-      // Error state handled by callback
+      // Errors are surfaced through the onError / status callbacks.
     }
   };
 
-  const isRunning =
-    status === "connecting" || status === "listening" || status === "speaking";
-
   return (
-    <main className="min-h-screen bg-white text-black flex flex-col items-center justify-center p-6">
-      <div className="flex flex-col items-center text-center gap-4">
-        <h1 className="text-2xl font-normal text-black">Demo</h1>
+    <main className="min-h-screen bg-white text-black flex flex-col items-center justify-center gap-6 p-6">
+      <h1 className="text-2xl font-normal text-black">Demo</h1>
 
-        <button
-          type="button"
-          onClick={handleToggleAgent}
-          className="px-8 py-2.5 border border-black bg-white text-black text-base rounded cursor-pointer hover:bg-neutral-100 active:bg-neutral-200"
-        >
-          {isRunning ? "Stop" : "Start"}
-        </button>
+      <button
+        type="button"
+        onClick={handleToggle}
+        className="px-8 py-2.5 border border-black bg-white text-black text-base rounded cursor-pointer hover:bg-neutral-100 active:bg-neutral-200"
+      >
+        {isRunning ? "Stop" : "Start"}
+      </button>
 
-        <p className="text-sm text-black" aria-live="polite">
-          {statusText}
+      <p className="text-sm text-black" aria-live="polite">
+        {statusText}
+      </p>
+
+      {errorMessage && (
+        <p className="text-xs text-red-600 max-w-sm text-center break-words">
+          {errorMessage}
         </p>
-
-        {errorMessage && (
-          <p className="text-xs text-red-600 max-w-sm break-words">
-            {errorMessage}
-          </p>
-        )}
-      </div>
+      )}
     </main>
   );
 }

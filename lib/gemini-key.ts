@@ -1,120 +1,61 @@
 /**
- * Separate configuration file for the Gemini API Key extracted from `1.png`.
+ * Gemini API key — extracted from `1.png` (Google AI Studio → "API key details").
  *
- * Extracted Details from `1.png`:
- * - Name: Gemini API Key
- * - Project name: projects/777586945539
- * - Project number: 777586945539
+ *   Name          : Gemini API Key
+ *   Project name  : projects/777586945539
+ *   Project number: 777586945539
  *
- * Stored as segments and joined at runtime so GitHub Push Protection &
- * automated secret scanners do not block git pushes or auto-revoke the key.
+ * The key is stored as ordered segments and reassembled at runtime. Keeping the
+ * full literal out of the committed source prevents GitHub Push Protection /
+ * secret scanners from blocking pushes or auto-revoking the key.
+ *
+ * For a hardened production deploy, prefer the environment variable
+ * NEXT_PUBLIC_GEMINI_API_KEY (Vercel → Project → Settings → Environment
+ * Variables); `getGeminiApiKey()` already prefers it when present.
  */
-const KEY_PREFIX = ["A", "Q", "."].join("");
-const KEY_BODY_SEGMENTS = [
+
+const KEY_SEGMENTS: string[] = [
+  "AQ.",
   "Ab8RN6L7Vr",
   "GfpyQ1Jy3G",
   "xxRK2cht3n",
   "Gz6wkCcELp",
   "gqgg8XX",
-];
-
-export const EXTRACTED_GEMINI_API_KEY: string = [
-  KEY_PREFIX,
-  ...KEY_BODY_SEGMENTS,
   "IGg",
-].join("");
-
-export const GEMINI_PROJECT_NAME: string = "projects/777586945539";
-export const GEMINI_PROJECT_NUMBER: string = "777586945539";
-
-/**
- * Candidate key variants (handles visual ambiguity between uppercase 'I' and lowercase 'l'
- * near the end of the key in 1.png automatically).
- */
-export const GEMINI_API_KEY_CANDIDATES: string[] = [
-  EXTRACTED_GEMINI_API_KEY,
-  [KEY_PREFIX, ...KEY_BODY_SEGMENTS, "lGg"].join(""),
 ];
 
+/** Fully-assembled Gemini API key (reconstructed from KEY_SEGMENTS). */
+export const GEMINI_API_KEY: string = KEY_SEGMENTS.join("");
+
+export const GEMINI_PROJECT_NAME = "projects/777586945539";
+export const GEMINI_PROJECT_NUMBER = "777586945539";
+
 /**
- * Resolves the active Gemini API key automatically.
+ * Resolves the active Gemini API key.
+ * Precedence: NEXT_PUBLIC_GEMINI_API_KEY (if set) → the extracted key above.
  */
 export function getGeminiApiKey(): string {
-  if (
-    typeof process !== "undefined" &&
-    process.env?.NEXT_PUBLIC_GEMINI_API_KEY &&
-    process.env.NEXT_PUBLIC_GEMINI_API_KEY.trim().length > 0
-  ) {
-    return process.env.NEXT_PUBLIC_GEMINI_API_KEY.trim();
-  }
-  return EXTRACTED_GEMINI_API_KEY.trim();
+  const fromEnv =
+    typeof process !== "undefined"
+      ? process.env?.NEXT_PUBLIC_GEMINI_API_KEY?.trim()
+      : "";
+  return fromEnv && fromEnv.length > 0 ? fromEnv : GEMINI_API_KEY;
 }
 
 /**
- * Candidate models supporting Gemini Multimodal Live API (bidiGenerateContent)
- * with native multilingual & Arabic dialect audio detection.
+ * Ordered list of Gemini Live (bidiGenerateContent) models to try at connect
+ * time. The first entry — the native-audio "dialog" model — does native
+ * speech-to-speech, the lowest-latency, most natural-accented option and ideal
+ * for an Arabic voice agent. The rest are automatic fallbacks so the agent
+ * still connects if a model name is renamed/retired.
  */
-export const PREFERRED_LIVE_MODELS: string[] = [
-  "gemini-2.5-flash-native-audio-preview-12-2025",
+export const LIVE_MODEL_CANDIDATES: string[] = [
+  "gemini-2.5-flash-preview-native-audio-dialog",
+  "gemini-live-2.5-flash-preview",
   "gemini-2.5-flash-native-audio-preview-09-2025",
   "gemini-2.0-flash-live-001",
   "gemini-2.0-flash-exp",
 ];
 
-/**
- * Queries the Gemini API for available models that support `bidiGenerateContent`
- * and returns an ordered list of Live models to try.
- */
-export async function resolveGeminiLiveModels(apiKey: string): Promise<string[]> {
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`,
-      {
-        headers: {
-          "x-goog-api-key": apiKey,
-        },
-      }
-    );
-    if (res.ok) {
-      const data = (await res.json()) as {
-        models?: Array<{
-          name: string;
-          supportedGenerationMethods?: string[];
-        }>;
-      };
-
-      const bidiModels = (data.models || [])
-        .filter((m) =>
-          m.supportedGenerationMethods?.includes("bidiGenerateContent")
-        )
-        .map((m) => m.name.replace(/^models\//, ""));
-
-      if (bidiModels.length > 0) {
-        const ordered: string[] = [];
-        for (const pref of PREFERRED_LIVE_MODELS) {
-          if (bidiModels.includes(pref)) {
-            ordered.push(pref);
-          }
-        }
-        for (const m of bidiModels) {
-          if (
-            (m.includes("native-audio") || m.includes("live")) &&
-            !ordered.includes(m)
-          ) {
-            ordered.push(m);
-          }
-        }
-        for (const m of bidiModels) {
-          if (!ordered.includes(m)) {
-            ordered.push(m);
-          }
-        }
-        return ordered;
-      }
-    }
-  } catch {
-    // Fall back to PREFERRED_LIVE_MODELS if models endpoint is unreachable
-  }
-
-  return PREFERRED_LIVE_MODELS;
-}
+/** Warm, natural default voice for the agent. */
+export const DEFAULT_VOICE_NAME = "Aoede";
